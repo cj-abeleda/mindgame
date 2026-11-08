@@ -15,6 +15,7 @@ interface Profile {
 }
 
 const PROFILE_KEY = 'mindgame.profile';
+const COMPLETED_SESSIONS_KEY = 'mindgame.completedSessions';
 const ON_MIND_MAX = 500;
 const POSITIONS = ['Guard', 'Wing', 'Big', 'Not sure'];
 const LEVELS = [
@@ -55,6 +56,27 @@ function writeStoredProfile(profile: Profile) {
     // Storage blocked (e.g. private mode): the profile still works for this visit.
   }
   profileListeners.forEach((listener) => listener());
+}
+
+// A session counts as completed once the athlete has sent at least one message in it.
+let memoryCompletedSessions = 0; // used when localStorage is blocked
+
+function readCompletedSessions(): number {
+  try {
+    const n = Number(localStorage.getItem(COMPLETED_SESSIONS_KEY));
+    return Number.isFinite(n) && n > 0 ? n : memoryCompletedSessions;
+  } catch {
+    return memoryCompletedSessions;
+  }
+}
+
+function markSessionCompleted() {
+  memoryCompletedSessions = readCompletedSessions() + 1;
+  try {
+    localStorage.setItem(COMPLETED_SESSIONS_KEY, String(memoryCompletedSessions));
+  } catch {
+    // Storage blocked: counted for this visit only.
+  }
 }
 
 function parseProfile(raw: string | null): Profile | null {
@@ -265,6 +287,9 @@ export default function Home() {
   const [isEditing, setIsEditing] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const sessionStarted = useRef(false);
+  // Fixed when the session starts: has this athlete completed a session with Angus before?
+  const isReturning = useRef(false);
+  const sessionCounted = useRef(false);
 
   // undefined during the server render, then the stored string (or null) in the browser.
   const storedProfile = useSyncExternalStore(subscribeProfile, readStoredProfile, () => undefined);
@@ -293,6 +318,7 @@ export default function Home() {
           },
         ],
         profile: activeProfile,
+        returning: isReturning.current,
       }),
     });
     const data = await response.json();
@@ -304,6 +330,7 @@ export default function Home() {
   useEffect(() => {
     if (view !== 'chat' || !profile || sessionStarted.current) return;
     sessionStarted.current = true;
+    isReturning.current = readCompletedSessions() > 0;
     startSession(profile);
   }, [view, profile]);
 
@@ -316,10 +343,15 @@ export default function Home() {
     setInput('');
     setIsLoading(true);
 
+    if (!sessionCounted.current) {
+      sessionCounted.current = true;
+      markSessionCompleted();
+    }
+
     const response = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: updatedMessages, profile }),
+      body: JSON.stringify({ messages: updatedMessages, profile, returning: isReturning.current }),
     });
 
     const data = await response.json();
