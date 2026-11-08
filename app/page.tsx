@@ -16,6 +16,18 @@ interface Profile {
 
 const PROFILE_KEY = 'mindgame.profile';
 const COMPLETED_SESSIONS_KEY = 'mindgame.completedSessions';
+const SESSIONS_KEY = 'mindgame.sessions';
+const MAX_SESSIONS = 5;
+
+interface SessionNotes {
+  id: string;
+  date: string;
+  pattern: string;
+  summary: string;
+  mentalModel: string;
+  cue: string;
+  returnPrompt: string;
+}
 const ON_MIND_MAX = 500;
 const POSITIONS = ['Guard', 'Wing', 'Big', 'Not sure'];
 const LEVELS = [
@@ -76,6 +88,41 @@ function markSessionCompleted() {
     localStorage.setItem(COMPLETED_SESSIONS_KEY, String(memoryCompletedSessions));
   } catch {
     // Storage blocked: counted for this visit only.
+  }
+}
+
+// Angus's notes for the athlete's most recent sessions, oldest first.
+let memorySessions: SessionNotes[] = []; // used when localStorage is blocked
+
+function readSessionHistory(): SessionNotes[] {
+  try {
+    const raw = localStorage.getItem(SESSIONS_KEY);
+    if (!raw) return memorySessions;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((s) => s && typeof s.id === 'string') : memorySessions;
+  } catch {
+    return memorySessions;
+  }
+}
+
+function saveSessionNotes(notes: SessionNotes) {
+  const sessions = [...readSessionHistory()];
+  const existing = sessions.findIndex((s) => s.id === notes.id);
+  if (existing >= 0) sessions[existing] = notes; // same session: replace with the newer notes
+  else sessions.push(notes);
+  memorySessions = sessions.slice(-MAX_SESSIONS);
+  try {
+    localStorage.setItem(SESSIONS_KEY, JSON.stringify(memorySessions));
+  } catch {
+    // Storage blocked: notes last for this visit only.
+  }
+}
+
+function newSessionId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 }
 
@@ -290,6 +337,10 @@ export default function Home() {
   // Fixed when the session starts: has this athlete completed a session with Angus before?
   const isReturning = useRef(false);
   const sessionCounted = useRef(false);
+  // This session's id and the notes from earlier sessions, both fixed when the session starts.
+  const sessionId = useRef('');
+  const pastSessions = useRef<SessionNotes[]>([]);
+  const latestNotesRequest = useRef(0);
 
   // undefined during the server render, then the stored string (or null) in the browser.
   const storedProfile = useSyncExternalStore(subscribeProfile, readStoredProfile, () => undefined);
@@ -319,6 +370,7 @@ export default function Home() {
         ],
         profile: activeProfile,
         returning: isReturning.current,
+        history: pastSessions.current,
       }),
     });
     const data = await response.json();
@@ -331,6 +383,8 @@ export default function Home() {
     if (view !== 'chat' || !profile || sessionStarted.current) return;
     sessionStarted.current = true;
     isReturning.current = readCompletedSessions() > 0;
+    sessionId.current = newSessionId();
+    pastSessions.current = readSessionHistory();
     startSession(profile);
   }, [view, profile]);
 
@@ -351,12 +405,39 @@ export default function Home() {
     const response = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: updatedMessages, profile, returning: isReturning.current }),
+      body: JSON.stringify({
+        messages: updatedMessages,
+        profile,
+        returning: isReturning.current,
+        history: pastSessions.current,
+      }),
     });
 
     const data = await response.json();
-    setMessages([...updatedMessages, { role: 'assistant', content: data.message }]);
+    const withReply: Message[] = [...updatedMessages, { role: 'assistant', content: data.message }];
+    setMessages(withReply);
     setIsLoading(false);
+    if (typeof data.message === 'string') updateSessionNotes(withReply);
+  };
+
+  // Refreshes this session's notes in the background after each of Angus's replies.
+  const updateSessionNotes = async (transcript: Message[]) => {
+    const requestNumber = ++latestNotesRequest.current;
+    const id = sessionId.current;
+    try {
+      const response = await fetch('/api/summarize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: transcript }),
+      });
+      if (!response.ok) return;
+      const { notes } = await response.json();
+      // Ignore a slower, older summary arriving after a newer one.
+      if (!notes || requestNumber !== latestNotesRequest.current) return;
+      saveSessionNotes({ ...notes, id, date: new Date().toISOString() });
+    } catch {
+      // Notes are best-effort; the next reply will try again.
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
